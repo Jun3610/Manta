@@ -1,0 +1,9 @@
+=== Bug Report [2026-07-15 04:52:36] ===
+채널: system (1520863023718334704)
+오류 종류: UnboundLocalError
+오류 메시지: cannot access local variable 'LMS_CHANNEL_ID' where it is not associated with a value
+트레이스백:
+NoneType: None
+
+발생 위치 힌트: event:on_message
+

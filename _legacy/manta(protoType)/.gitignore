@@ -1,0 +1,10 @@
+.env
+.env*
+venv/
+.DS_Store
+.vercel/
+__pycache__/
+*.pyc
+*.db
+manta_memory.json
+manta_log.txt
