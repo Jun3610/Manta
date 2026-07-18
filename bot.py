@@ -5,7 +5,7 @@ from discord.ext import commands
 import config
 
 # 기본 로깅 설정
-logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(name)s: %(message)s")
+logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("manta_bot")
 
 async def main():

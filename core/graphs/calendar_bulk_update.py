@@ -170,6 +170,21 @@ async def filter_node(state: BulkUpdateState) -> BulkUpdateState:
         events = await service.get_events_in_range(start_date, end_date)
         filtered = _apply_day_filter(events, day_filter)
 
+        # rules에 명시된 일정 제목만 필터링
+        rules = cmd.get("rules", {})
+        if rules:
+            rule_filtered = []
+            for ev in filtered:
+                title_nospace = ev.get("title", "").replace(" ", "").lower()
+                for rule_key in rules.keys():
+                    rule_key_nospace = rule_key.replace(" ", "").lower()
+                    # rule_key가 title에 포함되거나 반대인 경우 매칭 (예: 'OP출근' in 'OP 출근')
+                    if rule_key_nospace in title_nospace or title_nospace in rule_key_nospace:
+                        ev["matched_rule_key"] = rule_key
+                        rule_filtered.append(ev)
+                        break
+            filtered = rule_filtered
+
         logger.info(
             "[Filter] 날짜범위 %s~%s, 필터 '%s' → 대상 %d건",
             start_date, end_date, day_filter, len(filtered),
@@ -201,9 +216,10 @@ async def preview_node(state: BulkUpdateState) -> BulkUpdateState:
     rules = cmd.get("rules", {})
     for ev in events[:20]:  # 최대 20건 미리보기
         tag = ev.get("tag", "")
+        matched_key = ev.get("matched_rule_key", "")
         rule_info = ""
-        if rules and tag in rules:
-            times = rules[tag]
+        if rules and matched_key in rules:
+            times = rules[matched_key]
             rule_info = f" → {times[0]}~{times[1]}"
         lines.append(f"  - {ev.get('date', '')} {ev.get('title', '')} [{tag}]{rule_info}")
 
@@ -262,12 +278,12 @@ async def execute_node(state: BulkUpdateState) -> BulkUpdateState:
     failed: list[dict] = []
 
     for ev in events:
-        tag = ev.get("tag", "")
+        matched_key = ev.get("matched_rule_key", "")
         uid = ev.get("uid", ev.get("event_uid", ""))
 
         try:
-            if rules and tag in rules:
-                start_time_str, end_time_str = rules[tag]
+            if rules and matched_key in rules:
+                start_time_str, end_time_str = rules[matched_key]
                 await service.update_event_time(uid, start_time_str, end_time_str)
             succeeded.append(ev)
             logger.debug("[Execute] 성공: %s %s", ev.get("date"), ev.get("title"))
