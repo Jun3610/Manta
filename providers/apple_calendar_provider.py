@@ -100,6 +100,15 @@ class AppleCalendarProvider:
         mod_lines = []
         if new_title:
             mod_lines.append(f'set summary of evt to "{new_title}"')
+            
+        if new_start_dt or new_end_dt:
+            # -10025 에러(시작일이 종료일보다 늦어지는 순간 발생) 우회를 위해 
+            # 임시로 종료일을 아주 먼 미래(10년 뒤)로 밀어둠
+            mod_lines.append('''
+                set safeEd to (start date of evt) + (3650 * days)
+                set end date of evt to safeEd
+            ''')
+            
         if new_start_dt:
             mod_lines.append(f'''
                 set sd to start date of evt
@@ -110,6 +119,7 @@ class AppleCalendarProvider:
                 set minutes of sd to {new_start_dt.minute}
                 set seconds of sd to 0
                 set start date of evt to sd''')
+                
         if new_end_dt:
             mod_lines.append(f'''
                 set ed to end date of evt
