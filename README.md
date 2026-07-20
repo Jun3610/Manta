@@ -1,6 +1,10 @@
-# Manta2 리빌드 설계 명세서
+# Manta2
 
-> 버전: v2.1 (Phase 0 장애 대응 반영)
+> 이 README는 SPEC.md 기준으로 자동 생성됩니다. 최신 설계는 [SPEC.md](./SPEC.md)를 참고하세요.
+
+# 리빌드 설계 명세서
+
+> 버전: v2.2 (Phase 0 버그 수정 + 롤백 + 사용자 장기 메모리 반영)
 > 기준: manta1(discord.py 단일 프로세스) 코드 분석 + v2.0 아키텍처 + Phase 0 장애 리포트 후속 결정 통합
 > 대상: LLM 기반 코딩 에이전트(Aider / Claude Code / Antigravity 등)에게 그대로 투입 가능한 형태
 
@@ -491,85 +495,137 @@ manta2/
 ```
 
 ---
-# Extension SPEC
 
-# Manta Phase 5 — 구조 확장 (Discord Activity 대시보드 + 상시 TTS)
+## 8. 구현 시 주의사항
 
-> 이 문서는 `SPEC.md`(Phase 0~4)와 별개의 문서다.
-**전제조건: SPEC.md의 Phase 0~4가 전부 완료되고 안정화된 이후에 착수한다.**
-지금 단계에서 SPEC.md 본문에는 반영하지 않고, 별도 문서로 아이디어와 설계 방향만 기록해둔다.
-> 
-
----
-
-## 왜 별도 문서로 분리했는가
-
-- SPEC.md는 discord.py(Python) + LangChain/LangGraph 조합으로 통일돼 있는데, 이번 두 기능은 성격이 다르다:
-    - Activity 대시보드 → **JavaScript 웹앱**(Discord Embedded App SDK) 스택이 추가로 필요
-    - 상시 TTS → v1에 이미 존재했으나 이번 리빌드 범위에서 명시적으로 제외된 기능(SPEC.md 4장 J항목)
-- 두 기능 다 "지금 당장 필요한 기능"이 아니라 "SPEC.md 완료 후 여유가 생기면"에 해당하므로, 본 설계서 스코프를 흐리지 않도록 분리한다.
-
----
-
-## 1. Discord Activity 상시 대시보드
-
-### 1.1 목적
-
-- SPEC.md 2.7절에서 예약해둔 `llm_calls` metrics 테이블(호출 횟수, 토큰, 지연시간, 성공/실패)을 실시간 그래프로 상시 확인
-- 필요시 캘린더 현황, LMS 미제출 현황 등도 같은 화면에 함께 표시하는 통합 대시보드로 확장 가능
-
-### 1.2 기술 스택 (SPEC.md와 별개)
-
-- **Discord Embedded App SDK** (`@discord/embedded-app-sdk`, JavaScript)
-- 프론트엔드: 웹앱(iframe) — 차트 라이브러리(Chart.js/Recharts 등)로 렌더링
-- 백엔드: 별도 API 서버 필요 — Manta 봇 프로세스(Python)가 쌓은 SQLite `llm_calls` 데이터를 읽어 JSON으로 노출하는 경량 엔드포인트(예: FastAPI) 하나 추가
-- OAuth2 클라이언트 등록 (Discord Developer Portal에서 Activity 활성화 필요)
-- 호스팅: 웹앱을 어딘가에 배포해야 함 (로컬 M4 Pro로 상시 노출은 부적합 — 별도 소규모 호스팅 검토 필요)
-
-### 1.3 검토 필요 사항 (착수 전 확인)
-
-- Activity는 음성 채널 진입이 전제인 기능이라, "그냥 텍스트 채널에서 상시 보이는 대시보드"가 목적이면 Activity보다 **채널 토픽 갱신(schedule 태스크 방식) + 명령어 조회**가 더 간단할 수 있음 — 착수 전 "정말 Activity 형태가 필요한지" 재확인
-- Manta 봇 프로세스와 웹앱 백엔드가 같은 SQLite 파일에 동시 접근 시 락 경합 가능 → WAL 모드 또는 API 경유 단일 접근점 필요
-- 개인 프로젝트 규모에서 OAuth2 + 웹 호스팅까지 갖추는 게 실제로 필요한 투자인지, 착수 시점에 다시 판단
-
-### 1.4 최소 구현 범위 (1차 목표)
-
-1. FastAPI(또는 Flask) 경량 서버: `GET /metrics/daily` → 오늘 호출 횟수/토큰/에러율 JSON 반환
-2. Activity 프론트엔드: 해당 API를 폴링해 막대/선 그래프 1~2개만 표시 (일별 호출 수, 성공/실패 비율)
-3. Discord Developer Portal에서 Activity 등록 + 특정 채널에서 실행 가능하도록 설정
-4. 범위 확장(캘린더/LMS 현황 등)은 1차 목표 검증 후 판단
+1. **SPEC.md에 명시되지 않은 기능 추가 금지**
+2. **기존 v1 코드를 그대로 복붙하지 말고 구조만 참고**
+3. **모든 Phase 완료 후 반드시 다음 항목을 보고할 것:**
+   - 생성 파일 목록
+   - 삭제 파일 목록
+   - 변경 파일 목록
+   - 아키텍처 다이어그램
+4. **추측 구현 금지**
+5. **모호한 부분 발견 시 코드 작성 전에 질문**
+6. **Phase 단위 커밋 수행**
+7. **Phase 완료 후 테스트 결과 제출**
+8. **실패한 테스트가 있으면 다음 Phase 진행 금지**
+9. **구현/수정 완료 시 `reports/YYYY-MM-DD_작업명.md` 형식으로 보고서 저장 (9절 참조)**
 
 ---
 
-## 2. 상시 TTS
+## 6. 사용자 장기 메모리
 
-### 2.1 v1과의 관계
+대화 세션이 끝나도 사용자에 대한 사실(선호/습관/일정 패턴)을 기억해 다음 대화에서 컨텍스트로 활용한다.
 
-- SPEC.md 4장 J항목에 명시된 대로, v1에는 이미 STT(Whisper)/TTS(OpenAI TTS) 코드가 존재했으나 이번 리빌드에서 명시적으로 제외됨
-- 이번에 논의하는 "상시 TTS"는 v1의 "명령 시 TTS 실행"(`!tts [텍스트]`)과 다르게, **트리거 없이 지속적으로 특정 이벤트를 음성으로 알려주는 형태**로 이해하고 아래 설계
+### 6.1 구현 파일
 
-### 2.2 목적 (가정 — 착수 시 재확인 필요)
+| 파일 | 역할 |
+|------|------|
+| `infrastructure/database.py` | `user_memory` 테이블 스키마 정의 및 초기화 |
+| `services/memory_service.py` | `save_fact()` / `get_facts()` / `delete_fact()` CRUD |
+| `core/agent.py` | `chat()` 호출 시 `get_facts()`로 메모리 조회 후 시스템 프롬프트에 주입 |
+| `core/graphs/calendar_bulk_update.py` | `memory_extract_node` (Summary 뒤 선택적 단계) |
 
-- 음성 채널에 봇이 상주하면서, 리마인더/타이머 완료/새 알림 등 텍스트로 오던 알림을 자동으로 음성으로도 읽어줌
-- 예: "30분 뒤 알려줘" 타이머가 끝나면 텍스트 메시지뿐 아니라 음성 채널에서 TTS로도 알림
+### 6.2 테이블 스키마 (`data/user_memory.db`)
 
-### 2.3 설계 방향
+```sql
+CREATE TABLE user_memory (
+    channel_id TEXT NOT NULL,   -- Discord 채널 ID (세션 격리 키)
+    key        TEXT NOT NULL,   -- 사실 분류 키 (예: "work_schedule", "habit")
+    value      TEXT NOT NULL,   -- 자연어 사실
+    updated_at TEXT NOT NULL,   -- ISO 8601
+    PRIMARY KEY (channel_id, key)
+);
+```
 
-- discord.py의 `VoiceClient` 활용, 봇이 특정 음성 채널에 상시 연결 유지
-- 알림 발생 시점(`tasks/reminders.py`, `tasks/timers.py` 등 SPEC.md 기존 태스크)에서 텍스트 메시지 전송과 동시에 TTS 재생 트리거를 추가하는 구조 — **기존 태스크 로직 자체는 그대로 두고, 알림 전송 지점에 음성 출력 훅만 추가**
-- TTS 엔진: v1의 OpenAI TTS 재사용 여부, 또는 Claude API 생태계로 통일할지는 착수 시점에 별도 결정 (TTS는 Claude API 범위 밖이므로 provider 추상화 대상 아님)
+동일 `(channel_id, key)` 조합은 UPSERT로 최신 값만 유지한다.
 
-### 2.4 검토 필요 사항 (착수 전 확인)
+### 6.3 메모리 주입 흐름
 
-- "상시"의 정확한 의미 확정 필요: (a) 봇이 음성 채널에 24시간 상주, (b) 알림 발생 시에만 음성 채널 잠깐 입장 후 재생하고 나감 — 리소스/사용자 경험 관점에서 다름
-- 여러 채널에서 동시에 알림이 발생하면 음성 재생 순서/충돌 처리 필요
-- 사용자가 음성 채널에 없는데 봇만 상주하는 상황 방지 (인원 0명 시 자동 퇴장 등)
+```
+MantaAgent.chat(session_id, message)
+  └── MemoryService.get_facts(session_id) → {key: value} dict
+  └── _build_system_prompt(facts) → 베이스 프롬프트 + [사용자 정보] 섹션 주입
+      → 저장된 사실이 없으면 베이스 프롬프트만 사용 (토큰 절약)
+```
+
+### 6.4 보안 원칙
+
+⚠️ **절대 저장 금지 항목:**
+- 비밀번호, PIN, 보안 코드
+- 주민등록번호, 학번, 계좌번호
+- 의료 정보
+
+`memory_extract_node` 프롬프트에 이 금지 목록이 명시되어 있으므로 LLM이 추출을 시도하더라도 저장되지 않는다.
+
+**이 기능은 "사실 저장" 전용이다.** LLM이 스스로 새 tool이나 코드를 만들어 실행하는 기능이 아니며, 그런 기능은 **절대 추가하지 않는다.**
 
 ---
 
-## 3. 착수 순서 제안
+## 7. 근무 시간 기본 규칙 (DEFAULT_SHIFT_RULES)
 
-1. SPEC.md Phase 0~4 완료 및 최소 1~2주 실사용 안정화
-2. 이 문서의 1.4절(대시보드 최소 구현)부터 먼저 — TTS보다 리소스 투입이 적고 SPEC.md의 metrics 저장소(2.7절)와 바로 연결되므로
-3. 대시보드 안정화 후 상시 TTS 착수, 이때 2.4절 미정 사항들을 실제 설계로 확정
+### 7.1 정의 위치
+
+`config.py` 하단에 `DEFAULT_SHIFT_RULES: dict[str, tuple[str, str]]`로 정의.
+**시간대 변경 또는 새 태그 추가 시 이 파일만 수정하면 전체에 반영된다.**
+
+### 7.2 적용 우선순위
+
+| 우선순위 | 조건 |
+|---------|------|
+| 1위 (highest) | 사용자가 명시적으로 다른 시간 지정 (`parsed_command.rules` dict 존재 시) |
+| 2위 | `matched_rule_key`("OP" / "CL")로 `config.DEFAULT_SHIFT_RULES` 자동 추론 |
+
+### 7.3 현재 규칙
+
+| 태그 | 시작 | 종료 | 비고 |
+|------|------|------|------|
+| OP | 06:00 | 15:00 | 오전 6시 ~ 오후 3시 (휴게 12:00~13:00) |
+| CL | 15:00 | 24:00 | 오후 3시 ~ 자정 (휴게 18:00~19:00) |
+
+---
+
+## 8. 롤백(Rollback) 기능
+
+### 8.1 동작 원리
+
+```
+일괄 수정 Execute 시작 전
+  └── CalendarService.build_rollback_snapshot(events) → 원본 상태 dict 목록
+  └── rollback_store.save_snapshot() → data/rollback_snapshot.json 저장
+
+"롤백해줘" / "되돌려줘" / "undo" / "원래대로" 입력 시
+  └── Router → calendar_rollback 그래프
+  └── Load → Preview → Approval → Execute → Summary
+  └── Execute: CalendarService.modify_event()로 원본 시간 복원
+  └── 성공 시 rollback_snapshot.json 삭제 (중복 롤백 방지)
+```
+
+### 8.2 제약
+
+- **마지막 1회** 일괄 수정만 롤백 가능 (단일 스냅샷, 히스토리 스택 없음)
+- `data/rollback_snapshot.json`은 `.gitignore`에 의해 **커밋 금지** (`*.json` 규칙에 포함)
+- 롤백도 Approval 노드 필수 (데이터 수정 작업이므로 생략 불가)
+
+---
+
+## 9. 보고서 컨벤션 (reports/)
+
+구현/수정 작업을 완료할 때마다 `reports/` 폴더에 마크다운 파일로 보고서를 저장한다.
+
+### 파일명 규칙
+
+```
+reports/YYYY-MM-DD_작업명.md
+예: reports/2026-07-20_phase0-bugfix-rollback-memory.md
+```
+
+### 필수 형식
+
+- **첫 줄**: `# ` 로 시작하는 제목 한 줄 (GitHub 이슈 제목으로 자동 사용)
+- 변경된 파일 목록
+- 버그 수정 / 신규 기능 / 리팩토링 상세
+- 검증 결과 (문법 검사, 단위 테스트)
+- 다음 실행 항목
 
