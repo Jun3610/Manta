@@ -1,9 +1,12 @@
 import re
 import json
+import logging
 from datetime import datetime, date, timedelta
 from langchain_core.tools import tool
 from services.calendar_service import CalendarService
 from services.date_utils import resolve_date_string
+
+logger = logging.getLogger(__name__)
 
 calendar_service = CalendarService()
 
@@ -124,6 +127,7 @@ def add_apple_calendar_event(title: str, date_str: str, time_str: str = "09:00",
     - important (bool): 중요 일정 여부 (기본값 False)
     - end_date (str): 연속된 날짜에 동일 일정을 추가할 경우 종료일 (YYYY-MM-DD 형식)
     """
+    logger.info("[Tool Execution] add_apple_calendar_event: title=%s, date=%s, time=%s, duration=%s", title, date_str, time_str, duration_min)
     try:
         start_d, _ = resolve_date_string(date_str)
         if not start_d:
@@ -181,6 +185,7 @@ def modify_apple_calendar_event(event_uid: str, new_title: str = "", new_date: s
     - new_time (str): 변경할 새 시간 (HH:MM 형식)
     - new_duration_min (int): 변경할 소요 시간 (분 단위)
     """
+    logger.info("[Tool Execution] modify_apple_calendar_event: uid=%s, title=%s, date=%s, time=%s", event_uid, new_title, new_date, new_time)
     try:
         new_start_dt = None
         new_end_dt = None
@@ -231,6 +236,7 @@ def delete_apple_calendar_event(event_uid: str) -> str:
     (반드시 조회 도구들을 사용해 대상 이벤트의 UID를 확인하세요.)
     - event_uid (str): 삭제할 일정의 고유 식별자 (필수)
     """
+    logger.warning("[Tool Execution] delete_apple_calendar_event: uid=%s", event_uid)
     try:
         success = calendar_service.delete_event(event_uid)
         if success:
@@ -246,6 +252,7 @@ def delete_all_calendar_events_on_date(date_str: str) -> str:
     특정 날짜의 모든 일정을 삭제합니다.
     - date_str (str): 일정을 삭제할 날짜 (YYYY-MM-DD 형식) (필수)
     """
+    logger.warning("[Tool Execution] delete_all_calendar_events_on_date: date=%s", date_str)
     try:
         target_d, _ = resolve_date_string(date_str)
         if not target_d:
