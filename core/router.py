@@ -36,6 +36,15 @@ class RouteDecision(TypedDict):
 # 규칙 기반 매칭 설정
 # ---------------------------------------------------------------------------
 
+# 0순위: 롤백/되돌리기 전용 패턴 (bulk_update보다 먼저 검사)
+_ROLLBACK_KEYWORD_PATTERNS: list[re.Pattern] = [
+    re.compile(r"(되돌려|되돌려줘|되돌려\s*주세요)"),
+    re.compile(r"롤백"),
+    re.compile(r"undo", re.IGNORECASE),
+    re.compile(r"(취소해줘|취소\s*해줘|취소\s*주세요)"),  # "취소해줘" 단독 (일반 취소와 구분됨)
+    re.compile(r"원래대로"),
+]
+
 # 1순위: 자연어 키워드 패턴 → graph 후보
 # "일괄", "전부", "모두", "~별로", "조건부", "다르게", "바꿔줘" + 다건 암시
 _GRAPH_KEYWORD_PATTERNS: list[re.Pattern] = [
@@ -58,6 +67,7 @@ _GRAPH_TOOL_KEYWORDS: list[str] = [
 # graph_name 매핑 (키워드 → 그래프 모듈명)
 _GRAPH_NAME_MAP: dict[str, str] = {
     "calendar_bulk": "calendar_bulk_update",
+    "calendar_rollback": "calendar_rollback",
 }
 
 
@@ -76,10 +86,21 @@ def route(user_message: str, channel_id: str = "") -> RouteDecision:
     Returns:
         RouteDecision: {"path": "agent"|"graph", "graph_name": str|None, "reason": str}
     """
+    # 0순위: 롤백/되돌리기 키워드 (bulk_update보다 먼저 검사)
+    for pattern in _ROLLBACK_KEYWORD_PATTERNS:
+        if pattern.search(user_message):
+            decision: RouteDecision = {
+                "path": "graph",
+                "graph_name": "calendar_rollback",
+                "reason": f"롤백 키워드 패턴 매칭: '{pattern.pattern}'",
+            }
+            _log_decision(decision, user_message, channel_id)
+            return decision
+
     # 1순위: 자연어 키워드 패턴 매칭
     for pattern in _GRAPH_KEYWORD_PATTERNS:
         if pattern.search(user_message):
-            decision: RouteDecision = {
+            decision = {
                 "path": "graph",
                 "graph_name": "calendar_bulk_update",
                 "reason": f"키워드 패턴 매칭: '{pattern.pattern}'",

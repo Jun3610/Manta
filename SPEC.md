@@ -1,6 +1,6 @@
 # Manta2 리빌드 설계 명세서
 
-> 버전: v2.1 (Phase 0 장애 대응 반영)
+> 버전: v2.2 (Phase 0 버그 수정 + 롤백 + 사용자 장기 메모리 반영)
 > 기준: manta1(discord.py 단일 프로세스) 코드 분석 + v2.0 아키텍처 + Phase 0 장애 리포트 후속 결정 통합
 > 대상: LLM 기반 코딩 에이전트(Aider / Claude Code / Antigravity 등)에게 그대로 투입 가능한 형태
 
@@ -506,3 +506,122 @@ manta2/
 6. **Phase 단위 커밋 수행**
 7. **Phase 완료 후 테스트 결과 제출**
 8. **실패한 테스트가 있으면 다음 Phase 진행 금지**
+9. **구현/수정 완료 시 `reports/YYYY-MM-DD_작업명.md` 형식으로 보고서 저장 (9절 참조)**
+
+---
+
+## 6. 사용자 장기 메모리
+
+대화 세션이 끝나도 사용자에 대한 사실(선호/습관/일정 패턴)을 기억해 다음 대화에서 컨텍스트로 활용한다.
+
+### 6.1 구현 파일
+
+| 파일 | 역할 |
+|------|------|
+| `infrastructure/database.py` | `user_memory` 테이블 스키마 정의 및 초기화 |
+| `services/memory_service.py` | `save_fact()` / `get_facts()` / `delete_fact()` CRUD |
+| `core/agent.py` | `chat()` 호출 시 `get_facts()`로 메모리 조회 후 시스템 프롬프트에 주입 |
+| `core/graphs/calendar_bulk_update.py` | `memory_extract_node` (Summary 뒤 선택적 단계) |
+
+### 6.2 테이블 스키마 (`data/user_memory.db`)
+
+```sql
+CREATE TABLE user_memory (
+    channel_id TEXT NOT NULL,   -- Discord 채널 ID (세션 격리 키)
+    key        TEXT NOT NULL,   -- 사실 분류 키 (예: "work_schedule", "habit")
+    value      TEXT NOT NULL,   -- 자연어 사실
+    updated_at TEXT NOT NULL,   -- ISO 8601
+    PRIMARY KEY (channel_id, key)
+);
+```
+
+동일 `(channel_id, key)` 조합은 UPSERT로 최신 값만 유지한다.
+
+### 6.3 메모리 주입 흐름
+
+```
+MantaAgent.chat(session_id, message)
+  └── MemoryService.get_facts(session_id) → {key: value} dict
+  └── _build_system_prompt(facts) → 베이스 프롬프트 + [사용자 정보] 섹션 주입
+      → 저장된 사실이 없으면 베이스 프롬프트만 사용 (토큰 절약)
+```
+
+### 6.4 보안 원칙
+
+⚠️ **절대 저장 금지 항목:**
+- 비밀번호, PIN, 보안 코드
+- 주민등록번호, 학번, 계좌번호
+- 의료 정보
+
+`memory_extract_node` 프롬프트에 이 금지 목록이 명시되어 있으므로 LLM이 추출을 시도하더라도 저장되지 않는다.
+
+**이 기능은 "사실 저장" 전용이다.** LLM이 스스로 새 tool이나 코드를 만들어 실행하는 기능이 아니며, 그런 기능은 **절대 추가하지 않는다.**
+
+---
+
+## 7. 근무 시간 기본 규칙 (DEFAULT_SHIFT_RULES)
+
+### 7.1 정의 위치
+
+`config.py` 하단에 `DEFAULT_SHIFT_RULES: dict[str, tuple[str, str]]`로 정의.
+**시간대 변경 또는 새 태그 추가 시 이 파일만 수정하면 전체에 반영된다.**
+
+### 7.2 적용 우선순위
+
+| 우선순위 | 조건 |
+|---------|------|
+| 1위 (highest) | 사용자가 명시적으로 다른 시간 지정 (`parsed_command.rules` dict 존재 시) |
+| 2위 | `matched_rule_key`("OP" / "CL")로 `config.DEFAULT_SHIFT_RULES` 자동 추론 |
+
+### 7.3 현재 규칙
+
+| 태그 | 시작 | 종료 | 비고 |
+|------|------|------|------|
+| OP | 06:00 | 15:00 | 오전 6시 ~ 오후 3시 (휴게 12:00~13:00) |
+| CL | 15:00 | 24:00 | 오후 3시 ~ 자정 (휴게 18:00~19:00) |
+
+---
+
+## 8. 롤백(Rollback) 기능
+
+### 8.1 동작 원리
+
+```
+일괄 수정 Execute 시작 전
+  └── CalendarService.build_rollback_snapshot(events) → 원본 상태 dict 목록
+  └── rollback_store.save_snapshot() → data/rollback_snapshot.json 저장
+
+"롤백해줘" / "되돌려줘" / "undo" / "원래대로" 입력 시
+  └── Router → calendar_rollback 그래프
+  └── Load → Preview → Approval → Execute → Summary
+  └── Execute: CalendarService.modify_event()로 원본 시간 복원
+  └── 성공 시 rollback_snapshot.json 삭제 (중복 롤백 방지)
+```
+
+### 8.2 제약
+
+- **마지막 1회** 일괄 수정만 롤백 가능 (단일 스냅샷, 히스토리 스택 없음)
+- `data/rollback_snapshot.json`은 `.gitignore`에 의해 **커밋 금지** (`*.json` 규칙에 포함)
+- 롤백도 Approval 노드 필수 (데이터 수정 작업이므로 생략 불가)
+
+---
+
+## 9. 보고서 컨벤션 (reports/)
+
+구현/수정 작업을 완료할 때마다 `reports/` 폴더에 마크다운 파일로 보고서를 저장한다.
+
+### 파일명 규칙
+
+```
+reports/YYYY-MM-DD_작업명.md
+예: reports/2026-07-20_phase0-bugfix-rollback-memory.md
+```
+
+### 필수 형식
+
+- **첫 줄**: `# ` 로 시작하는 제목 한 줄 (GitHub 이슈 제목으로 자동 사용)
+- 변경된 파일 목록
+- 버그 수정 / 신규 기능 / 리팩토링 상세
+- 검증 결과 (문법 검사, 단위 테스트)
+- 다음 실행 항목
+

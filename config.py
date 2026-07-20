@@ -48,3 +48,19 @@ ALLOWED_DOMAINS = [os.getenv("ALLOWED_DOMAIN_1"), os.getenv("ALLOWED_DOMAIN_2")]
 GMAIL_ADDRESS = os.getenv("GMAIL_ADDRESS")
 GMAIL_CREDENTIALS_PATH = os.getenv("GMAIL_CREDENTIALS_PATH", "credentials.json")
 GMAIL_TOKEN_PATH = os.getenv("GMAIL_TOKEN_PATH", "gmail_token.json")
+
+# ====== 4. 근무 시간 기본 규칙 (DEFAULT_SHIFT_RULES) ======
+# 이벤트 제목에서 근무 유형을 자동 추론할 때 참조하는 기본 시간 매핑.
+# - key   : 이벤트 제목에 포함된 근무 유형 태그 (대문자)
+# - value : (시작시간 "HH:MM", 종료시간 "HH:MM")
+#
+# ⚠️ 새 태그 추가 또는 시간 변경 시 이 파일만 수정하면 전체에 반영된다.
+#    execute_node / preview_node / 기타 로직은 이 상수를 참조하므로 별도 수정 불필요.
+#
+# 현재 적용 규칙:
+#   OP 출근: 오전 6시 ~ 오후 3시 (휴게 12:00~13:00)
+#   CL 출근: 오후 3시 ~ 자정    (휴게 18:00~19:00)
+DEFAULT_SHIFT_RULES: dict[str, tuple[str, str]] = {
+    "OP": ("06:00", "15:00"),
+    "CL": ("15:00", "24:00"),
+}

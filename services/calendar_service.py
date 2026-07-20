@@ -243,3 +243,37 @@ class CalendarService:
 
         return self.modify_event(uid, new_start_dt=new_start_dt, new_end_dt=new_end_dt)
 
+    async def build_rollback_snapshot(self, events: list[dict]) -> list[dict]:
+        """
+        롤백용 원본 스냅샷을 DB에서 조회해 반환한다 (SPEC 5.2.1절).
+
+        execute_node가 수정을 시작하기 직전에 호출해야 한다.
+        반환된 목록을 infrastructure.rollback_store.save_snapshot()으로 저장하면
+        나중에 calendar_rollback 그래프에서 복원할 수 있다.
+
+        Args:
+            events: 수정 예정 이벤트 목록 (uid 포함).
+
+        Returns:
+            DB에서 조회한 원본 이벤트 dict 목록.
+            조회에 실패한 항목은 결과에서 제외된다.
+        """
+        snapshot: list[dict] = []
+        for ev in events:
+            uid = ev.get("uid", ev.get("event_uid", ""))
+            if not uid:
+                continue
+            original = self.get_event_by_uid(uid)
+            if original:
+                snapshot.append(original)
+            else:
+                logger.warning(
+                    "[CalendarService.build_rollback_snapshot] uid '%s' 조회 실패 → 스냅샷 제외.", uid
+                )
+        logger.info(
+            "[CalendarService.build_rollback_snapshot] %d/%d건 스냅샷 수집 완료.",
+            len(snapshot), len(events),
+        )
+        return snapshot
+
+

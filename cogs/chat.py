@@ -109,12 +109,21 @@ class ChatCog(commands.Cog):
 
         현재 지원 그래프:
           - "calendar_bulk_update": 캘린더 일괄 수정 (SPEC 2.2절)
+          - "calendar_rollback"    : 마지막 일괄 수정 되돌리기
 
         신규 그래프 추가 시: 이 메서드에 elif 분기 추가만 하면 됨.
         """
         if graph_name == "calendar_bulk_update":
             from core.graphs.calendar_bulk_update import run as run_bulk_update
             return await run_bulk_update(
+                user_message=user_message,
+                channel_id=channel_id,
+                discord_channel=discord_channel,
+            )
+
+        if graph_name == "calendar_rollback":
+            from core.graphs.calendar_rollback import run as run_rollback
+            return await run_rollback(
                 user_message=user_message,
                 channel_id=channel_id,
                 discord_channel=discord_channel,

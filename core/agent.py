@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # 시스템 프롬프트 (SPEC 1.1절 — 언어 강제 프롬프트 최상단 필수)
 # ---------------------------------------------------------------------------
-_SYSTEM_PROMPT = """\
+_BASE_SYSTEM_PROMPT = """\
 [CRITICAL LANGUAGE CONSTRAINT]
 너는 Manta, 한국어 전용 비서야. 모든 응답은 무조건 한국어로만 해.
 중국어, 일본어, 영어 등 다른 언어는 절대 사용 금지. 사용자가 외국어를 써도 한국어로 답변해야 해.
@@ -50,6 +50,30 @@ _SYSTEM_PROMPT = """\
 """
 
 
+def _build_system_prompt(facts: dict[str, str]) -> str:
+    """
+    베이스 시스템 프롬프트에 사용자 장기 메모리를 주입한 프롬프트를 반환한다.
+
+    저장된 사실이 없으면 [사용자 정보] 섹션을 생략해 욬필요한 토큰 낙비를 마는다.
+
+    Args:
+        facts: MemoryService.get_facts()가 반환한 {key: value} dict.
+
+    Returns:
+        완성된 시스템 프롬프트 문자열.
+    """
+    if not facts:
+        return _BASE_SYSTEM_PROMPT
+
+    facts_lines = "\n".join(f"  - {k}: {v}" for k, v in facts.items())
+    memory_section = f"""
+[사용자 정보 — 장기 메모리]
+이 정보는 이전 대화에서 학습한 사실이다. 대화 컨텍스트로 활용하되, 비출하지 마라.
+{facts_lines}
+"""
+    return _BASE_SYSTEM_PROMPT + memory_section
+
+
 class MantaAgent:
     """
     Manta2 챗봇의 핵심 에이전트 클래스 (단순 요청 경로).
@@ -68,39 +92,46 @@ class MantaAgent:
         self._llm = provider.get_chat_model(role="chat")
         self._model_name = self._llm.model  # metrics 기록용
 
-        # 2. 시스템 프롬프트 설정
-        self._prompt = ChatPromptTemplate.from_messages([
-            ("system", _SYSTEM_PROMPT),
+        # 2. 도구 바인딩
+        self._tools = _load_tools()
+
+        logger.info("[MantaAgent] 초기화 완료. 모델: %s", self._model_name)
+
+    def _build_runnable(self, system_prompt: str):
+        """
+        주어진 시스템 프롬프트로 AgentExecutor + 히스토리 랩퍼를 조립한다.
+
+        chat() 호출 마다 메모리 주입으로 프롬프트가 달라지므로
+        AgentExecutor를 정적으로 저장하지 않고 동적으로 생성한다.
+        """
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", system_prompt),
             MessagesPlaceholder(variable_name="history"),
             ("human", "{input}"),
             MessagesPlaceholder(variable_name="agent_scratchpad"),
         ])
-
-        # 3. 도구 바인딩
-        self._tools = _load_tools()
-
-        # 4. AgentExecutor 조립
-        agent = create_tool_calling_agent(self._llm, self._tools, self._prompt)
-        self._agent_executor = AgentExecutor(
+        agent = create_tool_calling_agent(self._llm, self._tools, prompt)
+        executor = AgentExecutor(
             agent=agent,
             tools=self._tools,
             verbose=True,
             handle_parsing_errors=True,
         )
-
-        # 5. 세션별 히스토리 바인딩
-        self._agent_with_history = RunnableWithMessageHistory(
-            self._agent_executor,
+        return RunnableWithMessageHistory(
+            executor,
             get_session_history,
             input_messages_key="input",
             history_messages_key="history",
         )
 
-        logger.info("[MantaAgent] 초기화 완료. 모델: %s", self._model_name)
-
     async def chat(self, session_id: str, message: str) -> str:
         """
         주어진 세션 ID 의 대화 히스토리를 유지하며 에이전트와 대화한다.
+
+        장기 메모리 주입:
+          MemoryService.get_facts()로 저장된 사실을 조회한 후
+          시스템 프롬프트에 [사용자 정보] 섹션으로 주입한다.
+          저장된 사실이 없으면 인자 프롬프트를 사용하여 토큰 낙비를 막는다.
 
         LLM 호출 성공/실패 여부를 metrics 에 기록한다 (SPEC 2.7절).
         실패 시 fallback_formatter 로 규칙 기반 응답을 반환한다 (SPEC 2.5절).
@@ -112,11 +143,22 @@ class MantaAgent:
         Returns:
             에이전트 응답 텍스트. 실패 시 규칙 기반 fallback 텍스트.
         """
+        # 장기 메모리 조회 후 동적 시스템 프롬프트 구성
+        try:
+            from services.memory_service import MemoryService
+            facts = MemoryService().get_facts(session_id)
+        except Exception as mem_err:
+            logger.warning("[MantaAgent] 메모리 조회 실패 (무시 후 계속): %s", mem_err)
+            facts = {}
+
+        system_prompt = _build_system_prompt(facts)
+        agent_with_history = self._build_runnable(system_prompt)
+
         config_dict = {"configurable": {"session_id": session_id}}
         start_ms = int(time.monotonic() * 1000)
 
         try:
-            response = await self._agent_with_history.ainvoke(
+            response = await agent_with_history.ainvoke(
                 {"input": message},
                 config=config_dict,
             )

@@ -34,6 +34,7 @@ from typing_extensions import TypedDict
 
 from core.graphs.nodes.approval import request_approval
 from infrastructure.metrics import record_llm_call_async
+from infrastructure.rollback_store import save_snapshot
 from services.fallback_formatter import format_bulk_execute_results, format_calendar_results
 from services.calendar_service import CalendarService
 
@@ -59,7 +60,8 @@ class BulkUpdateState(TypedDict, total=False):
     parse_error: Optional[str]  # Parse 실패 메시지
 
     # Filter 노드 출력
-    target_events: list[dict]   # 수정 대상 이벤트 목록
+    target_events: list[dict]       # 수정 대상 이벤트 목록 (출근 이벤트만)
+    weekday_work_events: list[dict] # 평일 근무 일정 (별도 보고용)
     filter_error: Optional[str]
 
     # Preview 노드 출력
@@ -72,6 +74,7 @@ class BulkUpdateState(TypedDict, total=False):
     # Execute 노드 출력
     succeeded: list[dict]       # 성공한 항목
     failed: list[dict]          # 실패한 항목
+    rollback_snapshot: list[dict]  # 롤백용 원본 스냅샷
 
     # Summary 노드 출력 (최종 응답)
     final_response: str
@@ -155,6 +158,11 @@ async def filter_node(state: BulkUpdateState) -> BulkUpdateState:
     [Filter] Service 레이어 순수 Python — 대상 이벤트 추출 (LLM 호출 없음).
 
     datetime.now() 기준으로 상대 날짜 범위를 절대 날짜로 환산 (SPEC 2.4절).
+
+    출근 이벤트 필터 정책:
+      1. rules dict가 있으면 rule_key 기준으로 매칭.
+      2. rules가 없으면 제목에 "출근" 포함 여부로 자동 필터링 (버그 수정).
+      3. report_filter="weekday"인 경우 평일 출근 일정을 weekday_work_events로 별도 수집.
     """
     if state.get("parse_error"):
         return state
@@ -168,28 +176,50 @@ async def filter_node(state: BulkUpdateState) -> BulkUpdateState:
         day_filter = cmd.get("day_filter", "all")
 
         events = await service.get_events_in_range(start_date, end_date)
-        filtered = _apply_day_filter(events, day_filter)
+        day_filtered = _apply_day_filter(events, day_filter)
 
-        # rules에 명시된 일정 제목만 필터링
-        rules = cmd.get("rules", {})
+        rules = cmd.get("rules") or {}
         if rules:
+            # rules dict가 명시된 경우: rule_key 기준 매칭
             rule_filtered = []
-            for ev in filtered:
+            for ev in day_filtered:
                 title_nospace = ev.get("title", "").replace(" ", "").lower()
                 for rule_key in rules.keys():
                     rule_key_nospace = rule_key.replace(" ", "").lower()
-                    # rule_key가 title에 포함되거나 반대인 경우 매칭 (예: 'OP출근' in 'OP 출근')
                     if rule_key_nospace in title_nospace or title_nospace in rule_key_nospace:
                         ev["matched_rule_key"] = rule_key
                         rule_filtered.append(ev)
                         break
             filtered = rule_filtered
+        else:
+            # [버그 수정] rules 없을 때: 제목에 "출근" 포함 이벤트만 자동 필터링
+            # OP출근, CL출근, OP 출근, CL 출근 등 모두 포함
+            filtered = []
+            for ev in day_filtered:
+                title = ev.get("title", "")
+                if "출근" in title:
+                    # 제목에서 근무 유형 추론 (OP / CL)
+                    work_type = _infer_work_type(title)
+                    if work_type:
+                        ev["matched_rule_key"] = work_type
+                    filtered.append(ev)
+
+        # 평일 근무 별도 수집 (report_filter="weekday")
+        weekday_events: list[dict] = []
+        report_filter = cmd.get("report_filter", "")
+        if report_filter == "weekday":
+            all_work = await service.get_events_in_range(start_date, end_date)
+            weekday_work = _apply_day_filter(all_work, "weekday")
+            weekday_events = [
+                ev for ev in weekday_work if "출근" in ev.get("title", "")
+            ]
+            logger.info("[Filter] 평일 근무 %d건 별도 수집.", len(weekday_events))
 
         logger.info(
-            "[Filter] 날짜범위 %s~%s, 필터 '%s' → 대상 %d건",
-            start_date, end_date, day_filter, len(filtered),
+            "[Filter] 날짜범위 %s~%s, 요일필터 '%s' → 출근 %d건 (평일 %d건)",
+            start_date, end_date, day_filter, len(filtered), len(weekday_events),
         )
-        return {**state, "target_events": filtered}
+        return {**state, "target_events": filtered, "weekday_work_events": weekday_events}
 
     except Exception as e:
         logger.error("[Filter] 실패: %s", e, exc_info=True)
@@ -199,6 +229,9 @@ async def filter_node(state: BulkUpdateState) -> BulkUpdateState:
 async def preview_node(state: BulkUpdateState) -> BulkUpdateState:
     """
     [Preview] Filter 결과를 사용자가 확인할 수 있는 형태로 표시 (LLM 호출 없음).
+
+    - 변경 후 시간(→ HH:MM~HH:MM) 을 각 행에 표시.
+    - 평일 근무 일정이 있으면 하단에 별도 섹션으로 표시.
     """
     if state.get("parse_error"):
         return {**state, "preview_text": f"❌ 분석 오류: {state['parse_error']}"}
@@ -206,28 +239,46 @@ async def preview_node(state: BulkUpdateState) -> BulkUpdateState:
         return {**state, "preview_text": f"❌ 필터 오류: {state['filter_error']}"}
 
     events = state.get("target_events", [])
+    weekday_events = state.get("weekday_work_events", [])
     cmd = state.get("parsed_command", {})
+    rules = cmd.get("rules") or {}
 
     if not events:
-        preview = "ℹ️ 조건에 해당하는 일정이 없습니다. 변경할 내용이 없습니다."
-        return {**state, "preview_text": preview, "approved": False}
+        preview_lines = ["ℹ️ 조건에 해당하는 출근 일정이 없습니다. 변경할 내용이 없습니다."]
+        if weekday_events:
+            preview_lines.append("")
+            preview_lines.append(f"📅 평일 근무 일정 ({len(weekday_events)}건):")
+            for ev in weekday_events:
+                preview_lines.append(f"  - {ev.get('date', '')} {ev.get('title', '')}")
+        return {**state, "preview_text": "\n".join(preview_lines), "approved": False}
 
-    lines = [f"📋 다음 {len(events)}건이 변경됩니다:"]
-    rules = cmd.get("rules", {})
+    lines = [f"📋 다음 {len(events)}건 출근 일정이 변경됩니다:"]
     for ev in events[:20]:  # 최대 20건 미리보기
         tag = ev.get("tag", "")
         matched_key = ev.get("matched_rule_key", "")
-        rule_info = ""
+
+        # 변경 시간 결정: rules > 자동 추론
         if rules and matched_key in rules:
             times = rules[matched_key]
-            rule_info = f" → {times[0]}~{times[1]}"
-        lines.append(f"  - {ev.get('date', '')} {ev.get('title', '')} [{tag}]{rule_info}")
+            time_info = f" → {times[0]}~{times[1]}"
+        else:
+            inferred = _get_work_time_rule(matched_key)
+            time_info = f" → {inferred[0]}~{inferred[1]}" if inferred else ""
+
+        lines.append(f"  - {ev.get('date', '')} {ev.get('title', '')} [{tag}]{time_info}")
 
     if len(events) > 20:
         lines.append(f"  ... 외 {len(events) - 20}건")
 
+    # 평일 근무 별도 섹션
+    if weekday_events:
+        lines.append("")
+        lines.append(f"📅 평일 근무 일정 ({len(weekday_events)}건, 변경 미포함):")
+        for ev in weekday_events:
+            lines.append(f"  - {ev.get('date', '')} {ev.get('title', '')}")
+
     preview = "\n".join(lines)
-    logger.info("[Preview] 생성 완료 (%d건).", len(events))
+    logger.info("[Preview] 생성 완료 (%d건, 평일 %d건).", len(events), len(weekday_events))
     return {**state, "preview_text": preview}
 
 
@@ -264,29 +315,64 @@ async def execute_node(state: BulkUpdateState) -> BulkUpdateState:
     [Execute] Service 레이어 순수 Python — 실제 수정 수행 (LLM 호출 없음).
 
     승인된 경우에만 실행. 각 항목 성공/실패를 개별 기록 (부분 실패 허용).
+
+    OP/CL 규칙 적용 우선순위:
+      1. parsed_command.rules에 명시된 시간
+      2. matched_rule_key("OP" / "CL")로 기본 규칙 자동 추론
+         - OP → 06:00~15:00
+         - CL → 15:00~24:00
+
+    롤백 스냅샷:
+      Execute 시작 전 변경 대상 이벤트의 원본 상태를 JSON 파일에 저장한다.
     """
     if not state.get("approved"):
         logger.info("[Execute] 미승인 → 건너뜀.")
-        return {**state, "succeeded": [], "failed": []}
+        return {**state, "succeeded": [], "failed": [], "rollback_snapshot": []}
 
     events = state.get("target_events", [])
     cmd = state.get("parsed_command", {})
-    rules = cmd.get("rules", {})
+    rules = cmd.get("rules") or {}
 
     service = CalendarService()
     succeeded: list[dict] = []
     failed: list[dict] = []
+
+    # ── 롤백 스냅샷: CalendarService에 위임해 원본 상태 수집 후 저장 ──────
+    snapshot = await service.build_rollback_snapshot(events)
+    save_snapshot(snapshot)
+    logger.info("[Execute] 롤백 스냅샷 저장: %d건.", len(snapshot))
+    # ──────────────────────────────────────────────────────────────────────
+
 
     for ev in events:
         matched_key = ev.get("matched_rule_key", "")
         uid = ev.get("uid", ev.get("event_uid", ""))
 
         try:
+            # 적용할 시간 결정: 명시 rules > 자동 추론
             if rules and matched_key in rules:
                 start_time_str, end_time_str = rules[matched_key]
-                await service.update_event_time(uid, start_time_str, end_time_str)
+            else:
+                inferred = _get_work_time_rule(matched_key)
+                if inferred:
+                    start_time_str, end_time_str = inferred
+                else:
+                    # 규칙을 결정할 수 없는 이벤트는 건너뜀
+                    logger.warning(
+                        "[Execute] 규칙 없음 → 건너뜀: %s %s (matched_key='%s')",
+                        ev.get("date"), ev.get("title"), matched_key,
+                    )
+                    ev_copy = dict(ev)
+                    ev_copy["reason"] = "OP/CL 규칙을 판별할 수 없습니다."
+                    failed.append(ev_copy)
+                    continue
+
+            await service.update_event_time(uid, start_time_str, end_time_str)
             succeeded.append(ev)
-            logger.debug("[Execute] 성공: %s %s", ev.get("date"), ev.get("title"))
+            logger.debug(
+                "[Execute] 성공: %s %s → %s~%s",
+                ev.get("date"), ev.get("title"), start_time_str, end_time_str,
+            )
 
         except Exception as e:
             ev_copy = dict(ev)
@@ -295,12 +381,15 @@ async def execute_node(state: BulkUpdateState) -> BulkUpdateState:
             logger.warning("[Execute] 실패: %s %s — %s", ev.get("date"), ev.get("title"), e)
 
     logger.info("[Execute] 완료. 성공 %d / 실패 %d", len(succeeded), len(failed))
-    return {**state, "succeeded": succeeded, "failed": failed}
+    return {**state, "succeeded": succeeded, "failed": failed, "rollback_snapshot": snapshot}
 
 
 async def summary_node(state: BulkUpdateState) -> BulkUpdateState:
     """
     [Summary] 결과를 사람이 읽기 좋은 형태로 정리 (LLM 호출 1회, 실패 시 fallback).
+
+    - 평일 근무 일정이 있으면 결과 메시지에 포함.
+    - "되돌리려면 '롤백해줘'라고 입력하세요" 안내 문구 추가.
     """
     # 오류 또는 미승인 케이스
     if state.get("parse_error"):
@@ -308,10 +397,19 @@ async def summary_node(state: BulkUpdateState) -> BulkUpdateState:
     if state.get("filter_error"):
         return {**state, "final_response": f"❌ {state['filter_error']}"}
     if not state.get("approved"):
-        return {**state, "final_response": "취소되었습니다. 변경이 이루어지지 않았습니다."}
+        # 미승인이지만 평일 근무 보고가 있으면 같이 출력
+        weekday_events = state.get("weekday_work_events", [])
+        base = "취소되었습니다. 변경이 이루어지지 않았습니다."
+        if weekday_events:
+            lines = [base, "", f"📅 이번 달 평일 근무 일정 ({len(weekday_events)}건):"]
+            for ev in weekday_events:
+                lines.append(f"  - {ev.get('date', '')} ({_weekday_kr(ev.get('date', ''))}) {ev.get('title', '')}")
+            return {**state, "final_response": "\n".join(lines)}
+        return {**state, "final_response": base}
 
     succeeded = state.get("succeeded", [])
     failed = state.get("failed", [])
+    weekday_events = state.get("weekday_work_events", [])
 
     # LLM 으로 자연스러운 요약 생성 시도
     from core.providers.anthropic_provider import get_provider
@@ -324,13 +422,21 @@ async def summary_node(state: BulkUpdateState) -> BulkUpdateState:
         f"{e.get('date')} {e.get('title')} ({e.get('reason', '')})"
         for e in failed[:3]
     ]
+    weekday_list = [
+        f"{e.get('date')} ({_weekday_kr(e.get('date', ''))}) {e.get('title', '')}"
+        for e in weekday_events
+    ]
     summary_prompt = (
         f"다음 일괄 수정 결과를 한국어로 친절하게 요약해줘 (2~4문장):\n"
         f"성공: {len(succeeded)}건, 실패: {len(failed)}건\n"
         f"성공 목록: {succeeded_list}\n"
-        f"실패 목록: {failed_list}"
+        f"실패 목록: {failed_list}\n"
+        + (
+            f"평일 근무 일정 (변경 미포함, 별도 안내): {weekday_list}\n"
+            if weekday_list else ""
+        )
+        + "마지막에 '되돌리려면 롤백해줘 라고 입력하세요.' 라고 안내해줘."
     )
-
 
     start_ms = int(time.monotonic() * 1000)
     try:
@@ -353,8 +459,124 @@ async def summary_node(state: BulkUpdateState) -> BulkUpdateState:
             latency_ms=latency_ms, status="error", error_type=str(type(e).__name__),
         )
         # Fallback (SPEC 2.5절)
-        fallback = format_bulk_execute_results(succeeded, failed)
-        return {**state, "final_response": fallback}
+        fallback_lines = [format_bulk_execute_results(succeeded, failed)]
+        if weekday_events:
+            fallback_lines.append("")
+            fallback_lines.append(f"📅 평일 근무 일정 ({len(weekday_events)}건):")
+            for ev in weekday_events:
+                fallback_lines.append(
+                    f"  - {ev.get('date', '')} ({_weekday_kr(ev.get('date', ''))}) {ev.get('title', '')}"
+                )
+        fallback_lines.append("\n↩️ 되돌리려면 '롤백해줘'라고 입력하세요.")
+        return {**state, "final_response": "\n".join(fallback_lines)}
+
+
+async def memory_extract_node(state: BulkUpdateState) -> BulkUpdateState:
+    """
+    [MemoryExtract] 대화 결과에서 기억할 만한 사실을 추출해 저장한다 (선택적 단계).
+
+    - LLM 1회 호출로 "기억할 사실"이 있는지 판단.
+    - 없으면 아무것도 하지 않는다 (LLM 호출 자체를 생략 — 토큰 비용 없음).
+    - 있으면 MemoryService.save_fact()로 저장.
+
+    보안 원칙:
+      ⚠️ 비밀번호, 학번, 금융 정보 등 민감 정보는 절대 저장하지 않는다.
+         프롬프트에 해당 금지 지시가 명시되어 있다.
+
+    이 노드는 항상 LangGraph END 직전에 위치한다.
+    오류 발생 시 무시하고 final_response를 그대로 유지한다.
+    """
+    # 승인 후 실제 변경이 있었던 경우만 메모리 추출 시도
+    if not state.get("approved") or not state.get("succeeded"):
+        return state
+
+    channel_id = state.get("channel_id", "")
+    succeeded = state.get("succeeded", [])
+    weekday_events = state.get("weekday_work_events", [])
+
+    # 추출할 컨텍스트 요약
+    context_lines = [
+        f"- {ev.get('date')} {ev.get('title')} → 변경 성공"
+        for ev in succeeded[:10]
+    ]
+    if weekday_events:
+        context_lines.append("[평일 근무 일정]")
+        for ev in weekday_events:
+            context_lines.append(f"- {ev.get('date')} {ev.get('title')}")
+
+    extract_prompt = f"""\
+다음은 방금 실행된 캘린더 일괄 수정 결과입니다.
+이 내용에서 사용자에 대해 **앞으로도 기억해야 할 사실**이 있으면 JSON 배열로 반환하세요.
+없으면 반드시 빈 배열 []만 반환하세요 (설명 없이).
+
+기억할 사실 기준:
+- 반복적인 근무 패턴 (예: OP/CL 출근 시간대)
+- 사용자가 명시한 선호나 습관
+- 다음 대화에서 유용할 메타 정보
+
+절대 저장 금지 (민감 정보):
+- 비밀번호, PIN, 보안 코드
+- 주민등록번호, 학번, 계좌번호
+- 의료 정보
+
+반환 형식 (JSON 배열):
+[
+  {{"key": "분류키", "value": "자연어 사실"}},
+  ...
+]
+
+실행 결과:
+{chr(10).join(context_lines)}
+"""
+
+    try:
+        from core.providers.anthropic_provider import get_provider
+        import json as _json
+        provider = get_provider()
+        llm = provider.get_chat_model(role="parse")  # 저비용 모델 사용
+        from langchain_core.messages import HumanMessage as _HM
+
+        start_ms = int(time.monotonic() * 1000)
+        response = await llm.ainvoke([_HM(content=extract_prompt)])
+        latency_ms = int(time.monotonic() * 1000) - start_ms
+
+        raw = response.content.strip()
+        # JSON 배열 추출
+        import re as _re
+        arr_match = _re.search(r"\[.*\]", raw, _re.DOTALL)
+        if not arr_match:
+            logger.debug("[MemoryExtract] 추출 결과 없음 (빈 배열 또는 파싱 실패).")
+            return state
+
+        facts_list = _json.loads(arr_match.group())
+        if not facts_list:
+            logger.debug("[MemoryExtract] 기억할 사실 없음 → 건너뜀.")
+            return state
+
+        from services.memory_service import MemoryService
+        mem_svc = MemoryService()
+        saved_count = 0
+        for item in facts_list:
+            k = item.get("key", "").strip()
+            v = item.get("value", "").strip()
+            if k and v:
+                try:
+                    mem_svc.save_fact(channel_id, k, v)
+                    saved_count += 1
+                except Exception as save_err:
+                    logger.warning("[MemoryExtract] 저장 실패: key=%s → %s", k, save_err)
+
+        await record_llm_call_async(
+            role="parse", model=llm.model,
+            channel_id=channel_id,
+            latency_ms=latency_ms, status="success",
+        )
+        logger.info("[MemoryExtract] %d건 사실 저장 완료.", saved_count)
+
+    except Exception as e:
+        logger.warning("[MemoryExtract] 오류 발생 (무시 후 계속): %s", e)
+
+    return state
 
 
 # ---------------------------------------------------------------------------
@@ -401,6 +623,7 @@ def build_calendar_bulk_update_graph():
     graph.add_node("approval", approval_node)
     graph.add_node("execute", execute_node)
     graph.add_node("summary", summary_node)
+    graph.add_node("memory_extract", memory_extract_node)  # 선택적 메모리 추출
 
     # 엣지 설정
     graph.set_entry_point("parse")
@@ -409,7 +632,8 @@ def build_calendar_bulk_update_graph():
     graph.add_edge("preview", "approval")
     graph.add_conditional_edges("approval", _should_execute, {"execute": "execute", "summary": "summary"})
     graph.add_edge("execute", "summary")
-    graph.add_edge("summary", END)
+    graph.add_edge("summary", "memory_extract")  # Summary 후 항상 메모리 추출 시도
+    graph.add_edge("memory_extract", END)
 
     return graph.compile()
 
@@ -450,10 +674,12 @@ async def run(
         "discord_channel": discord_channel,
         "parsed_command": {},
         "target_events": [],
+        "weekday_work_events": [],
         "preview_text": "",
         "approved": None,  # None = 아직 결정 전 (False와 구분)
         "succeeded": [],
         "failed": [],
+        "rollback_snapshot": [],
         "final_response": "",
     }
 
@@ -468,6 +694,68 @@ async def run(
 # ---------------------------------------------------------------------------
 # 내부 헬퍼 (순수 Python — LLM 호출 없음)
 # ---------------------------------------------------------------------------
+# 회사 목록 기본 근무 시간 규칙은 config.DEFAULT_SHIFT_RULES에 정의되어 있습니다.
+# 시간대 변경 또는 새 태그 추가 시 config.py만 수정하면 전체에 반영됩니다.
+
+
+def _infer_work_type(title: str) -> str:
+    """
+    이벤트 제목에서 근무 유형("OP" / "CL")을 추론한다.
+
+    Args:
+        title: 이벤트 제목 (예: "OP6 출근", "CL2 출근", "CL 출근")
+
+    Returns:
+        "OP" 또는 "CL" (판별 불가 시 빈 문자열)
+    """
+    title_upper = title.upper().replace(" ", "")
+    if "OP" in title_upper:
+        return "OP"
+    if "CL" in title_upper:
+        return "CL"
+    return ""
+
+
+def _get_work_time_rule(work_type: str) -> Optional[tuple[str, str]]:
+    """
+    근무 유형 키워드("OP" / "CL")에 대응하는 기본 시간 규칙을 반환한다.
+
+    config.DEFAULT_SHIFT_RULES를 참조하므로, 시간대 변경 시 config.py 한 곳만 수정하면 된다.
+
+    사용자가 명시적으로 다른 시간을 지정하면 (rules dict 존재할 때)
+    한 이 함수를 거치지 않고 직접 적용되므로
+    DEFAULT_SHIFT_RULES보다 명시 규칙이 더 높은 우선순위를 가진다.
+
+    Args:
+        work_type: "OP", "CL" 또는 이를 포함하는 문자열.
+
+    Returns:
+        (start_time, end_time) 튜플 또는 None.
+    """
+    from config import DEFAULT_SHIFT_RULES
+    key_upper = work_type.upper().replace(" ", "") if work_type else ""
+    for rule_key, times in DEFAULT_SHIFT_RULES.items():
+        if rule_key in key_upper:
+            return times
+    return None
+
+
+def _weekday_kr(date_str: str) -> str:
+    """
+    날짜 문자열("YYYY-MM-DD")을 한국어 요일 이름으로 변환한다.
+
+    Args:
+        date_str: ISO 형식 날짜 문자열.
+
+    Returns:
+        "월" / "화" / ... / "일" (파싱 실패 시 빈 문자열)
+    """
+    _KR_WEEKDAYS = ["월", "화", "수", "목", "금", "토", "일"]
+    try:
+        d = date.fromisoformat(date_str)
+        return _KR_WEEKDAYS[d.weekday()]
+    except (ValueError, TypeError):
+        return ""
 
 def _resolve_date_range(range_str: str) -> tuple[date, date]:
     """
