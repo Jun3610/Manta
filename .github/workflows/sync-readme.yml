@@ -1,0 +1,30 @@
+name: Sync README from SPEC
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'SPEC.md'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Copy SPEC.md into README.md
+        run: |
+          echo "# Manta2" > README.md
+          echo "" >> README.md
+          echo "> 이 README는 SPEC.md 기준으로 자동 생성됩니다. 최신 설계는 [SPEC.md](./SPEC.md)를 참고하세요." >> README.md
+          echo "" >> README.md
+          cat SPEC.md >> README.md
+
+      - name: Commit and push if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git diff --staged --quiet || git commit -m "docs: README 자동 동기화 (SPEC.md 변경 반영)"
+          git push
+
