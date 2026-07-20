@@ -3,6 +3,7 @@ import json
 from datetime import datetime, date, timedelta
 from langchain_core.tools import tool
 from services.calendar_service import CalendarService
+from services.date_utils import resolve_date_string
 
 calendar_service = CalendarService()
 
@@ -57,13 +58,27 @@ def get_week_events() -> str:
 def get_events_by_range(start_date: str, end_date: str) -> str:
     """
     특정 기간의 일정을 조회합니다. 반환 데이터는 요약본입니다.
-    - start_date (str): 시작일 (YYYY-MM-DD 형식) (필수)
-    - end_date (str): 종료일 (YYYY-MM-DD 형식) (필수)
+    - start_date (str): 시작일 (예: "2026-07-01", "7월", "이번 주", "오늘") (필수)
+    - end_date (str): 종료일 (예: "2026-07-31", "7월", "이번 주", "오늘") (필수)
     """
     try:
         if not start_date or not end_date:
             return "❌ 시작일과 종료일을 모두 입력해주세요."
-        events = calendar_service.search_events(start_date=start_date, end_date=end_date)
+            
+        r_start, _ = resolve_date_string(start_date)
+        _, r_end = resolve_date_string(end_date)
+        
+        if r_start is None:
+            r_start_str = start_date # fallback
+        else:
+            r_start_str = r_start.strftime("%Y-%m-%d")
+            
+        if r_end is None:
+            r_end_str = end_date # fallback
+        else:
+            r_end_str = r_end.strftime("%Y-%m-%d")
+
+        events = calendar_service.search_events(start_date=r_start_str, end_date=r_end_str)
         return _format_events_summary(events)
     except Exception as e:
         return f"😥 기간별 일정 조회 중 오류: {e}"
@@ -110,17 +125,17 @@ def add_apple_calendar_event(title: str, date_str: str, time_str: str = "09:00",
     - end_date (str): 연속된 날짜에 동일 일정을 추가할 경우 종료일 (YYYY-MM-DD 형식)
     """
     try:
-        def parse_date(d_str):
-            m = re.match(r"(\d{4})-(\d{2})-(\d{2})", d_str.strip())
-            if m:
-                return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-            return None
-
-        start_d = parse_date(date_str)
+        start_d, _ = resolve_date_string(date_str)
         if not start_d:
             return f"❌ 날짜 형식이 잘못되었습니다: {date_str} (YYYY-MM-DD 형식을 사용해주세요)"
             
-        end_d = parse_date(end_date) if end_date else start_d
+        if end_date:
+            end_d, _ = resolve_date_string(end_date)
+        else:
+            end_d = start_d
+            
+        if not end_d:
+            end_d = start_d
         if end_d < start_d:
             return "❌ 종료일이 시작일보다 빠를 수 없습니다."
 
@@ -181,11 +196,17 @@ def modify_apple_calendar_event(event_uid: str, new_title: str = "", new_date: s
             d_str = new_date if new_date else current_date
             t_str = new_time if new_time else current_time
             
-            dm = re.match(r"(\d{4})-(\d{2})-(\d{2})", d_str.strip())
+            new_d, _ = resolve_date_string(d_str)
+            if not new_d:
+                # fallback for manual format
+                dm = re.match(r"(\d{4})-(\d{2})-(\d{2})", d_str.strip())
+                if dm:
+                    new_d = date(int(dm.group(1)), int(dm.group(2)), int(dm.group(3)))
+            
             tm = re.match(r"(\d{1,2}):(\d{2})", t_str.strip())
             
-            if dm and tm:
-                new_start_dt = datetime(int(dm.group(1)), int(dm.group(2)), int(dm.group(3)),
+            if new_d and tm:
+                new_start_dt = datetime(new_d.year, new_d.month, new_d.day,
                                         int(tm.group(1)), int(tm.group(2)))
                 dur = new_duration_min if new_duration_min > 0 else target_ev['duration_min']
                 new_end_dt = new_start_dt + timedelta(minutes=dur)
@@ -226,9 +247,15 @@ def delete_all_calendar_events_on_date(date_str: str) -> str:
     - date_str (str): 일정을 삭제할 날짜 (YYYY-MM-DD 형식) (필수)
     """
     try:
-        events = calendar_service.search_events(start_date=date_str, end_date=date_str)
+        target_d, _ = resolve_date_string(date_str)
+        if not target_d:
+            target_str = date_str
+        else:
+            target_str = target_d.strftime("%Y-%m-%d")
+            
+        events = calendar_service.search_events(start_date=target_str, end_date=target_str)
         if not events:
-            return f"📭 {date_str}에 등록된 일정이 없습니다."
+            return f"📭 {target_str}에 등록된 일정이 없습니다."
             
         deleted_count = 0
         for ev in events:

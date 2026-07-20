@@ -176,9 +176,9 @@ class AppleCalendarProvider:
         set seconds of endDate to 59
         
         tell application "Calendar"
-            repeat with calName in {self.cal_list_literal}
+            repeat with cal in calendars
                 try
-                    set cal to first calendar whose name is calName
+                    set calName to name of cal
                     set evts to (every event of cal whose start date >= startDate and start date <= endDate)
                     repeat with evt in evts
                         try

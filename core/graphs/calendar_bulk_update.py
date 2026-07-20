@@ -37,6 +37,7 @@ from infrastructure.metrics import record_llm_call_async
 from infrastructure.rollback_store import save_snapshot
 from services.fallback_formatter import format_bulk_execute_results, format_calendar_results
 from services.calendar_service import CalendarService
+from services.date_utils import resolve_date_string
 
 logger = logging.getLogger(__name__)
 
@@ -172,7 +173,7 @@ async def filter_node(state: BulkUpdateState) -> BulkUpdateState:
     try:
         service = CalendarService()
         # range 문자열을 실제 날짜 범위로 환산 (Python 처리 — LLM 추론 금지)
-        start_date, end_date = _resolve_date_range(cmd.get("range", "이번달"))
+        start_date, end_date = resolve_date_string(cmd.get("range", "이번달"))
         day_filter = cmd.get("day_filter", "all")
 
         events = await service.get_events_in_range(start_date, end_date)
@@ -757,77 +758,6 @@ def _weekday_kr(date_str: str) -> str:
     except (ValueError, TypeError):
         return ""
 
-def _resolve_date_range(range_str: str) -> tuple[date, date]:
-    """
-    상대 날짜 표현을 datetime.now() 기준 절대 날짜 범위로 환산 (SPEC 2.4절).
-
-    Args:
-        range_str: "이번달", "이번주", "다음달", "YYYY-MM-DD~YYYY-MM-DD" 등.
-
-    Returns:
-        (start_date, end_date) 튜플.
-    """
-    today = datetime.now().date()
-
-    if "이번달" in range_str or "이번 달" in range_str:
-        start = today.replace(day=1)
-        # 다음 달 첫날 - 1일
-        if today.month == 12:
-            end = date(today.year + 1, 1, 1) - timedelta(days=1)
-        else:
-            end = date(today.year, today.month + 1, 1) - timedelta(days=1)
-        return start, end
-
-    if "다음달" in range_str or "다음 달" in range_str:
-        if today.month == 12:
-            start = date(today.year + 1, 1, 1)
-            end = date(today.year + 1, 2, 1) - timedelta(days=1)
-        else:
-            start = date(today.year, today.month + 1, 1)
-            if today.month + 1 == 12:
-                end = date(today.year + 1, 1, 1) - timedelta(days=1)
-            else:
-                end = date(today.year, today.month + 2, 1) - timedelta(days=1)
-        return start, end
-
-    if "이번주" in range_str or "이번 주" in range_str:
-        start = today - timedelta(days=today.weekday())  # 월요일
-        end = start + timedelta(days=6)  # 일요일
-        return start, end
-
-    if "다음주" in range_str or "다음 주" in range_str:
-        start = today - timedelta(days=today.weekday()) + timedelta(weeks=1)
-        end = start + timedelta(days=6)
-        return start, end
-
-    # "N월" 또는 "N월 지금까지" 등 특정 월 표현 (예: "7월", "7월 동안")
-    month_match = re.search(r"(\d{1,2})월", range_str)
-    if month_match:
-        month = int(month_match.group(1))
-        year = today.year
-        # 해당 월이 이미 지난 경우 다음 해로 처리 (예: 현재 8월인데 "7월" → 올해 7월 과거)
-        start = date(year, month, 1)
-        if month == 12:
-            end = date(year + 1, 1, 1) - timedelta(days=1)
-        else:
-            end = date(year, month + 1, 1) - timedelta(days=1)
-        # "지금까지" 포함 시 오늘까지만
-        if "지금까지" in range_str or "현재까지" in range_str:
-            end = min(end, today)
-        logger.info("[_resolve_date_range] '%s' → %s~%s", range_str, start, end)
-        return start, end
-
-    # YYYY-MM-DD~YYYY-MM-DD 형식 시도
-    match = re.search(r"(\d{4}-\d{2}-\d{2})~(\d{4}-\d{2}-\d{2})", range_str)
-    if match:
-        return (
-            date.fromisoformat(match.group(1)),
-            date.fromisoformat(match.group(2)),
-        )
-
-    # 파싱 불가 → 이번 달 기본값
-    logger.warning("[_resolve_date_range] 알 수 없는 range '%s' → 이번달 기본값 사용.", range_str)
-    return _resolve_date_range("이번달")
 
 
 def _apply_day_filter(events: list[dict], day_filter: str) -> list[dict]:

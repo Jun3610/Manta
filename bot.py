@@ -1,3 +1,7 @@
+import warnings
+from langchain_core._api.deprecation import LangChainDeprecationWarning
+warnings.filterwarnings("ignore", category=LangChainDeprecationWarning)
+
 import asyncio
 import logging
 import discord
@@ -7,6 +11,10 @@ import config
 # 기본 로깅 설정
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("manta_bot")
+
+# 서드파티 라이브러리의 불필요한 로그/경고 차단 (디버깅 화면 지저분함 방지)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 async def main():
     """

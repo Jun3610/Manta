@@ -13,6 +13,10 @@ from __future__ import annotations
 
 import logging
 import time
+import warnings
+from langchain_core._api.deprecation import LangChainDeprecationWarning
+warnings.filterwarnings("ignore", category=LangChainDeprecationWarning)
+
 from typing import Any
 
 from langchain_classic.agents import AgentExecutor, create_tool_calling_agent
@@ -114,7 +118,7 @@ class MantaAgent:
         executor = AgentExecutor(
             agent=agent,
             tools=self._tools,
-            verbose=True,
+            verbose=False,
             handle_parsing_errors=True,
         )
         return RunnableWithMessageHistory(
@@ -152,7 +156,9 @@ class MantaAgent:
             facts = {}
 
         system_prompt = _build_system_prompt(facts)
-        agent_with_history = self._build_runnable(system_prompt)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=LangChainDeprecationWarning)
+            agent_with_history = self._build_runnable(system_prompt)
 
         config_dict = {"configurable": {"session_id": session_id}}
         start_ms = int(time.monotonic() * 1000)
