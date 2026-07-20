@@ -90,36 +90,68 @@ async def parse_node(state: BulkUpdateState) -> BulkUpdateState:
     [Parse] 자연어 → 구조화된 명령 (LLM 호출 1회).
 
     LLM 은 날짜를 직접 계산하지 않고 상대 표현을 그대로 반환한다.
-    예: {"range": "이번달", "day_filter": "weekend",
+    예: {"range": "이번달", "day_filter": ["friday","saturday","sunday"],
          "rules": {"OP": ["06:00","15:00"], "CL": ["15:00","24:00"]},
          "report_filter": "weekday"}
+
+    - day_filter 는 항상 리스트로 반환 (복합 요일 지원).
+    - "추가근무" 등 OVERTIME_KEYWORDS 감지 시 자동 규칙 적용 안 하고 사용자에게 시간 되물음.
     """
     from core.providers.anthropic_provider import get_provider
+    from config import DEFAULT_SHIFT_RULES, OVERTIME_KEYWORDS
+
     provider = get_provider()
     llm = provider.get_chat_model(role="parse")
     model_name = llm.model
 
-    system_msg = SystemMessage(content="""\
+    # OVERTIME 키워드 선제 감지 (LLM 호출 전 Python 단에서 처리)
+    user_msg = state.get("user_message", "")
+    for kw in OVERTIME_KEYWORDS:
+        if kw in user_msg:
+            logger.info("[Parse] 추가근무 키워드 감지 → 사용자에게 시간 재문의.")
+            return {
+                **state,
+                "parse_error": (
+                    f"⚠️ '{kw}' 표현이 포함되어 있습니다.\n"
+                    "추가근무는 자동 시간 적용 대상이 아닙니다.\n"
+                    "정확한 시작 시간과 종료 시간을 알려주시면 바로 처리해 드릴게요! (예: 오후 6시~9시)"
+                ),
+            }
+
+    # DEFAULT_SHIFT_RULES를 프롬프트에 주입
+    shift_rules_str = "\n".join(
+        f"  - {k}: {v[0]}~{v[1]}"
+        for k, v in DEFAULT_SHIFT_RULES.items()
+    )
+
+    system_msg = SystemMessage(content=f"""\
 [CRITICAL LANGUAGE CONSTRAINT]
 모든 응답은 무조건 한국어로만 해.
 
 너는 사용자의 캘린더 수정 요청을 분석해 JSON으로 반환하는 파서야.
 
+[고정 근무 시간 규칙 — 반드시 이 값만 사용, 재추론 금지]
+{shift_rules_str}
+  - 기본 근무시간: 8시간
+  - 사용자가 명시적으로 다른 시간을 말하면 그 값을 우선 사용.
+
 반환 형식 (JSON만 반환, 설명 없음):
-{
+{{
   "range": "이번달" | "이번주" | "YYYY-MM-DD~YYYY-MM-DD" 등 원문 그대로,
-  "day_filter": "weekend" | "weekday" | "friday" | "all" 등,
-  "rules": {"태그명": ["시작시간", "종료시간"], ...} | null,
+  "day_filter": ["friday"] | ["saturday","sunday"] | ["friday","saturday","sunday"] | ["weekday"] | ["weekend"] | ["all"],
+  "rules": {{"태그명": ["시작시간", "종료시간"], ...}} | null,
   "report_filter": "weekday" | "weekend" | null,
   "action": "modify_time" | "delete" | "report_only"
-}
+}}
 
 주의:
 - 날짜 범위를 직접 계산하지 마라. "이번달", "다음주" 등 원문 그대로 반환.
 - 연도를 추정하지 마라.
 - 태그(OP, CL 등)가 있으면 rules 에 매핑해 반환.
+- day_filter 는 반드시 리스트(배열) 형태로 반환. "금토일" → ["friday","saturday","sunday"].
+- OP/CL 시간대는 위 [고정 근무 시간 규칙]을 그대로 사용하고 재계산하지 마라.
 """)
-    human_msg = HumanMessage(content=state["user_message"])
+    human_msg = HumanMessage(content=user_msg)
 
     start_ms = int(time.monotonic() * 1000)
     try:
@@ -134,6 +166,14 @@ async def parse_node(state: BulkUpdateState) -> BulkUpdateState:
             raise ValueError(f"JSON 추출 실패. LLM 응답: {raw}")
 
         parsed = json.loads(json_match.group())
+
+        # day_filter 정규화: str → list
+        df = parsed.get("day_filter")
+        if isinstance(df, str):
+            parsed["day_filter"] = [df]
+        elif df is None:
+            parsed["day_filter"] = ["all"]
+
         logger.info("[Parse] 구조화 결과: %s", parsed)
 
         await record_llm_call_async(
@@ -174,7 +214,12 @@ async def filter_node(state: BulkUpdateState) -> BulkUpdateState:
         service = CalendarService()
         # range 문자열을 실제 날짜 범위로 환산 (Python 처리 — LLM 추론 금지)
         start_date, end_date = resolve_date_string(cmd.get("range", "이번달"))
-        day_filter = cmd.get("day_filter", "all")
+        # day_filter 정규화: list 또는 str 모두 처리
+        raw_day_filter = cmd.get("day_filter", "all")
+        if isinstance(raw_day_filter, list):
+            day_filter = ",".join(raw_day_filter)
+        else:
+            day_filter = raw_day_filter
 
         events = await service.get_events_in_range(start_date, end_date)
         day_filtered = _apply_day_filter(events, day_filter)

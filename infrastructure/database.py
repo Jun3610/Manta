@@ -2,7 +2,6 @@ import sqlite3
 import os
 import logging
 from typing import Optional
-from langchain_community.chat_message_histories import SQLChatMessageHistory
 from langchain_core.chat_history import BaseChatMessageHistory
 
 logger = logging.getLogger(__name__)
@@ -96,11 +95,14 @@ def _init_user_memory_db():
 
 def get_session_history(session_id: str) -> BaseChatMessageHistory:
     """
-    주어진 세션 ID에 대한 영구적인 채팅 기록(SQLChatMessageHistory)을 반환합니다.
+    세션 ID별로 JSON 파일에 대화 기록을 저장·조회합니다.
+    SQLChatMessageHistory의 async/sync 충돌 문제를 우회하기 위해
+    FileChatMessageHistory를 사용합니다.
     """
-    connection_string = f"sqlite+aiosqlite:///{CHAT_HISTORY_DB_PATH}"
-    return SQLChatMessageHistory(
-        session_id=session_id,
-        connection=connection_string,
-        async_mode=True
-    )
+    from langchain_community.chat_message_histories import FileChatMessageHistory
+    history_dir = os.path.join(DATA_DIR, "chat_history")
+    os.makedirs(history_dir, exist_ok=True)
+    # session_id(채널 ID)를 파일명으로 사용
+    safe_id = str(session_id).replace("/", "_").replace("\\", "_")
+    history_path = os.path.join(history_dir, f"{safe_id}.json")
+    return FileChatMessageHistory(file_path=history_path)

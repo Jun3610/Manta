@@ -265,3 +265,60 @@ def delete_all_calendar_events_on_date(date_str: str) -> str:
         return f"🗑️ {date_str}의 일정 {deleted_count}개가 모두 삭제되었습니다."
     except Exception as e:
         return f"😥 날짜별 일정 삭제 중 오류가 발생했습니다: {e}"
+
+# ---------------------------------------------------------------------------
+# 근무 일정 전용 조회 도구 (SPEC 2.4절 확장 — 필터링·요일 계산을 Python이 처리)
+# ---------------------------------------------------------------------------
+
+_KR_WEEKDAYS = ["월", "화", "수", "목", "금", "토", "일"]
+
+def _compute_weekday_kr(date_str: str) -> str:
+    """YYYY-MM-DD 문자열을 한국어 요일로 변환. LLM에게 요일 추측을 맡기지 않기 위해 Python이 직접 계산."""
+    try:
+        d = date.fromisoformat(date_str)
+        return _KR_WEEKDAYS[d.weekday()]
+    except (ValueError, TypeError):
+        return ""
+
+@tool
+def get_work_schedule(range_str: str) -> str:
+    """
+    근무 일정(제목에 "출근" 포함)만 필터링하여 조회합니다.
+    날짜 범위 계산, 요일 계산, 필터링을 모두 Python이 처리합니다.
+    LLM은 절대 이 작업을 직접 계산하지 않습니다.
+
+    - range_str (str): 조회 기간 표현 (예: "이번달", "이번주", "7월", "오늘", "내일")
+    """
+    try:
+        start_d, end_d = resolve_date_string(range_str)
+        if start_d is None or end_d is None:
+            return f"❌ 기간을 인식할 수 없습니다: '{range_str}'. 예) 이번주, 이번달, 7월"
+
+        events = calendar_service.search_events(
+            start_date=start_d.strftime("%Y-%m-%d"),
+            end_date=end_d.strftime("%Y-%m-%d"),
+        )
+
+        # Python이 "출근" 필터링 + 요일 계산을 직접 처리 (LLM 위임 금지)
+        work_events = []
+        for ev in events:
+            title = ev.get("title", "")
+            if "출근" not in title:
+                continue
+            ev_date = ev.get("date", "")
+            work_events.append({
+                "uid": ev["uid"],
+                "date": ev_date,
+                "weekday": _compute_weekday_kr(ev_date),   # 요일을 Python이 미리 계산
+                "title": title,
+                "time": ev.get("time", ""),
+                "duration_min": ev.get("duration_min", 0),
+            })
+
+        if not work_events:
+            return f"📭 {range_str} 기간의 근무 일정이 없습니다."
+
+        return json.dumps(work_events, ensure_ascii=False, indent=2)
+
+    except Exception as e:
+        return f"😥 근무 일정 조회 중 오류: {e}"
