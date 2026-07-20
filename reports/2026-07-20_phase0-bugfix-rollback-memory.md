@@ -132,3 +132,4 @@ Execute 시작 전
 - [ ] Apple Calendar에서 OP/CL 시간 변경 확인
 - [ ] "롤백해줘" 입력 → 원래 시간 복원 확인
 - [ ] 2회 이상 대화 후 `data/user_memory.db` 사실 저장 확인
+
